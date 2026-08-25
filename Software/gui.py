@@ -120,7 +120,7 @@ except ImportError as e:
 # ports: FastAPI (Software -> Pluto commands/registration) and WebSocket
 # (Pluto -> Software live telemetry + camera stream).
 # ------------------------------------------------------------------------
-ROBOT_HOST = "raspberrypi.local"   # Pi's hostname / IP
+ROBOT_HOST = "100.103.110.54"   # Pi's hostname / IP
 ROBOT_API_PORT = 8000              # FastAPI server (server.py)
 ROBOT_WS_PORT = 8000               # websocket_server.py / camera_stream.py / telemetry.py
                                     # are all mounted onto the SAME FastAPI app as

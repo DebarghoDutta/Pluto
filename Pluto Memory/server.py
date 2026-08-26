@@ -1,8 +1,18 @@
 """
 server.py
 =========
-FastAPI server running on the Raspberry Pi 5. This is the single network
-entry point the desktop software (gui.py, via api_client.py) talks to.
+FastAPI route/app definitions for the Raspberry Pi 5 server. This module is
+NOT independently runnable anymore -- it has no Brain instance of its own
+and no `if __name__ == "__main__":` launcher. It only exposes a factory,
+`create_app(brain)`, that Brain.py's own `__main__` block calls to build the
+FastAPI app around the ONE Brain instance Brain.py creates and owns.
+
+    Brain.py            -- single point of execution: creates the Brain,
+                            starts it, builds the app via create_app(brain),
+                            and runs uvicorn. This is the only thing you run.
+    server.py (this file) -- pure route/app definitions, imported by Brain.py.
+                            Running `python server.py` directly does nothing
+                            useful on purpose -- see the guard at the bottom.
 
 Responsibilities:
     - Receive owner registration / update / delete requests (name, dob,
@@ -29,9 +39,9 @@ Responsibilities:
 Every piece of the project layout diagram's Software/RaspberryPi communication
 channels is now wired into this single FastAPI app.
 
-Run on the Pi with:
+Run on the Pi with (Brain.py is the entry point -- see its __main__ block):
     pip install fastapi "uvicorn[standard]" python-multipart
-    uvicorn server:app --host 0.0.0.0 --port 8000
+    python Brain.py
 """
 
 from typing import List, Optional
@@ -47,259 +57,259 @@ from telemetry import register_telemetry_routes
 
 
 # --------------------------------------------------------------------------
-# APP + SHARED BRAIN INSTANCE
+# APP FACTORY
 # --------------------------------------------------------------------------
+# No module-level `app` and no module-level `Brain()` instance anymore --
+# both are created by Brain.py and handed in here. This is what makes
+# Brain.py the single point of execution: server.py can no longer be started
+# on its own (there is nothing at module scope to run), it only assembles
+# routes around whatever Brain instance it's given.
 
-app = FastAPI(title="Pluto Server", version="0.1.0")
-
-# TODO(connect): lock this down to the desktop app's actual origin/IP once
-# known, instead of allowing all origins.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Single Brain instance for the whole server process. Brain owns the single
-# OwnerManager instance and shares it with ShortTermMemory, so calling
-# brain.reload_owners() here refreshes STM's recognition data everywhere.
-brain = Brain()
-
-# Wires up WS /ws/live plus the background broadcast loop that pushes STM
-# updates (owner recognition events, sensor snapshot, recent raw rows) to
-# every connected desktop client on a fixed interval.
-register_websocket_routes(app, brain)
-
-# Wires up WS /ws/camera plus the background loop that streams live JPEG
-# frames from the same camera CameraCapture already has open for detection.
-register_camera_stream_routes(app, brain)
-
-# Wires up WS /ws/telemetry (+ GET /telemetry) plus the background loop that
-# pushes CPU/RAM/battery/temp stats for the desktop dashboard's stat strip.
-register_telemetry_routes(app)
-
-
-@app.on_event("startup")
-def _startup():
-    """Start STM capture threads (camera/mic/sensors) when the server boots."""
-    brain.start()
-
-
-@app.on_event("shutdown")
-def _shutdown():
-    brain.stop()
-
-
-# --------------------------------------------------------------------------
-# HELPERS
-# --------------------------------------------------------------------------
-
-async def _read_upload_files(files: Optional[List[UploadFile]]):
-    """Converts FastAPI UploadFile objects into (filename, bytes) tuples,
-    the format owner_manager.py expects."""
-    result = []
-    for f in files or []:
-        content = await f.read()
-        result.append((f.filename, content))
-    return result
-
-
-# --------------------------------------------------------------------------
-# OWNER REGISTRATION / MANAGEMENT ENDPOINTS
-# --------------------------------------------------------------------------
-
-@app.post("/owners/register")
-async def register_owner(
-    name: str = Form(...),
-    dob: str = Form(""),
-    face_files: List[UploadFile] = File(...),
-    voice_files: List[UploadFile] = File(...),
-):
+def create_app(brain: Brain) -> FastAPI:
     """
-    Called by the desktop software's owner-registration screen. Accepts the
-    owner's name, dob, one or more face images, and one or more voice
-    samples as multipart form-data.
+    Builds and returns the FastAPI app wired around `brain`. Brain.py calls
+    this once, after constructing its single Brain instance, and passes the
+    returned app to uvicorn itself -- server.py never starts/stops `brain`
+    and never launches uvicorn; that lifecycle lives entirely in Brain.py.
     """
-    faces = await _read_upload_files(face_files)
-    voices = await _read_upload_files(voice_files)
+    app = FastAPI(title="Pluto Server", version="0.1.0")
 
-    try:
-        owner_row = brain.owner_manager.register_owner(
-            name=name, dob=dob, face_files=faces, voice_files=voices
-        )
-    except OwnerValidationError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # TODO(connect): lock this down to the desktop app's actual origin/IP
+    # once known, instead of allowing all origins.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-    # Refresh STM face/speaker recognition immediately.
-    brain.reload_owners()
+    # Wires up WS /ws/live plus the background broadcast loop that pushes
+    # STM updates (owner recognition events, sensor snapshot, recent raw
+    # rows) to every connected desktop client on a fixed interval.
+    register_websocket_routes(app, brain)
 
-    return {"status": "ok", "owner": owner_row}
+    # Wires up WS /ws/camera plus the background loop that streams live
+    # JPEG frames from the same camera CameraCapture already has open for
+    # detection.
+    register_camera_stream_routes(app, brain)
 
+    # Wires up WS /ws/telemetry (+ GET /telemetry) plus the background loop
+    # that pushes CPU/RAM/battery/temp stats for the desktop dashboard's
+    # stat strip.
+    register_telemetry_routes(app)
 
-@app.get("/owners")
-def list_owners():
-    """Returns every registered owner (for the GUI's owner-management screen)."""
-    return {"owners": brain.owner_manager.list_owners()}
+    # ---------------------------------------------------------------- #
+    # HELPERS
+    # ---------------------------------------------------------------- #
 
+    async def _read_upload_files(files: Optional[List[UploadFile]]):
+        """Converts FastAPI UploadFile objects into (filename, bytes)
+        tuples, the format owner_manager.py expects."""
+        result = []
+        for f in files or []:
+            content = await f.read()
+            result.append((f.filename, content))
+        return result
 
-@app.get("/owners/{owner_id}")
-def get_owner(owner_id: str):
-    owner = brain.owner_manager.get_owner(owner_id)
-    if not owner:
-        raise HTTPException(status_code=404, detail="Owner not found.")
-    return owner
+    # ---------------------------------------------------------------- #
+    # OWNER REGISTRATION / MANAGEMENT ENDPOINTS
+    # ---------------------------------------------------------------- #
 
+    @app.post("/owners/register")
+    async def register_owner(
+        name: str = Form(...),
+        dob: str = Form(""),
+        face_files: List[UploadFile] = File(...),
+        voice_files: List[UploadFile] = File(...),
+    ):
+        """
+        Called by the desktop software's owner-registration screen. Accepts
+        the owner's name, dob, one or more face images (gui.py now always
+        sends front + left-side + right-side samples), and one or more
+        voice samples as multipart form-data.
+        """
+        faces = await _read_upload_files(face_files)
+        voices = await _read_upload_files(voice_files)
 
-@app.put("/owners/{owner_id}")
-async def update_owner(
-    owner_id: str,
-    name: Optional[str] = Form(None),
-    dob: Optional[str] = Form(None),
-    add_face_files: Optional[List[UploadFile]] = File(None),
-    add_voice_files: Optional[List[UploadFile]] = File(None),
-):
-    """
-    Called when the GUI updates an existing owner (rename, new dob, or
-    additional face/voice samples added to improve recognition accuracy).
-    """
-    faces = await _read_upload_files(add_face_files)
-    voices = await _read_upload_files(add_voice_files)
+        try:
+            owner_row = brain.owner_manager.register_owner(
+                name=name, dob=dob, face_files=faces, voice_files=voices
+            )
+        except OwnerValidationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-    try:
-        updated = brain.owner_manager.update_owner(
-            owner_id,
-            name=name,
-            dob=dob,
-            add_face_files=faces or None,
-            add_voice_files=voices or None,
-        )
-    except OwnerValidationError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Refresh STM face/speaker recognition immediately.
+        brain.reload_owners()
 
-    brain.reload_owners()
-    return {"status": "ok", "owner": updated}
+        return {"status": "ok", "owner": owner_row}
 
+    @app.get("/owners")
+    def list_owners():
+        """Returns every registered owner (for the GUI's owner-management screen)."""
+        return {"owners": brain.owner_manager.list_owners()}
 
-@app.delete("/owners/{owner_id}")
-def delete_owner(owner_id: str):
-    try:
-        brain.owner_manager.delete_owner(owner_id)
-    except OwnerValidationError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    @app.get("/owners/{owner_id}")
+    def get_owner(owner_id: str):
+        owner = brain.owner_manager.get_owner(owner_id)
+        if not owner:
+            raise HTTPException(status_code=404, detail="Owner not found.")
+        return owner
 
-    brain.reload_owners()
-    return {"status": "ok", "deleted": owner_id}
+    @app.put("/owners/{owner_id}")
+    async def update_owner(
+        owner_id: str,
+        name: Optional[str] = Form(None),
+        dob: Optional[str] = Form(None),
+        add_face_files: Optional[List[UploadFile]] = File(None),
+        add_voice_files: Optional[List[UploadFile]] = File(None),
+    ):
+        """
+        Called when the GUI updates an existing owner (rename, new dob, or
+        additional face/voice samples added to improve recognition accuracy).
+        """
+        faces = await _read_upload_files(add_face_files)
+        voices = await _read_upload_files(add_voice_files)
 
+        try:
+            updated = brain.owner_manager.update_owner(
+                owner_id,
+                name=name,
+                dob=dob,
+                add_face_files=faces or None,
+                add_voice_files=voices or None,
+            )
+        except OwnerValidationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-# --------------------------------------------------------------------------
-# BASIC HEALTH / STATUS ENDPOINTS
-# --------------------------------------------------------------------------
+        brain.reload_owners()
+        return {"status": "ok", "owner": updated}
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    @app.delete("/owners/{owner_id}")
+    def delete_owner(owner_id: str):
+        try:
+            brain.owner_manager.delete_owner(owner_id)
+        except OwnerValidationError as e:
+            raise HTTPException(status_code=404, detail=str(e))
 
+        brain.reload_owners()
+        return {"status": "ok", "deleted": owner_id}
 
-@app.get("/stm/snapshot")
-def stm_snapshot(seconds: Optional[int] = None):
-    """
-    Quick read endpoint for the GUI's Memory Core screen to poll raw STM rows
-    directly, ahead of websocket_server.py providing a push-based feed.
-    """
-    return {"rows": brain.get_short_term_snapshot(seconds)}
+    # ---------------------------------------------------------------- #
+    # BASIC HEALTH / STATUS ENDPOINTS
+    # ---------------------------------------------------------------- #
 
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
 
-# --------------------------------------------------------------------------
-# MEMORY CORE SUMMARY ENDPOINTS (gui.py's Memory Core screen, via
-# api_client.get_memory_summary())
-# --------------------------------------------------------------------------
+    @app.get("/stm/snapshot")
+    def stm_snapshot(seconds: Optional[int] = None):
+        """
+        Quick read endpoint for the GUI's Memory Core screen to poll raw STM
+        rows directly, ahead of websocket_server.py providing a push-based
+        feed.
+        """
+        return {"rows": brain.get_short_term_snapshot(seconds)}
 
-def _memory_card(title: str, short_desc: str, purpose: str, used_mb: float,
-                  total_mb: float, entries: list) -> dict:
-    return {
-        "title": title,
-        "short_desc": short_desc,
-        "purpose": purpose,
-        "used_mb": round(used_mb, 2),
-        "total_mb": total_mb,
-        "entries": entries,
-    }
+    # ---------------------------------------------------------------- #
+    # MEMORY CORE SUMMARY ENDPOINTS (gui.py's Memory Core screen, via
+    # api_client.get_memory_summary())
+    # ---------------------------------------------------------------- #
 
+    def _memory_card(title: str, short_desc: str, purpose: str, used_mb: float,
+                      total_mb: float, entries: list) -> dict:
+        return {
+            "title": title,
+            "short_desc": short_desc,
+            "purpose": purpose,
+            "used_mb": round(used_mb, 2),
+            "total_mb": total_mb,
+            "entries": entries,
+        }
 
-@app.get("/memory/{memory_type}/summary")
-def memory_summary(memory_type: str):
-    """
-    Returns a summary card for one of the four Memory Core subsystems, in
-    the exact shape gui.py's MemoryCoreCard / MemoryDetailPopup expect:
-    {title, short_desc, purpose, used_mb, total_mb, entries: [(title, detail, ts), ...]}
-    """
-    if memory_type == "short_term":
-        rows = brain.get_short_term_snapshot()
-        entries = [
-            (f"{r.get('source')}:{r.get('data_type')}",
-             str(r.get("attributes")), r.get("timestamp", ""))
-            for r in rows
-        ]
-        return _memory_card(
-            title="Short Term Memory",
-            short_desc=f"{len(rows)} raw sensory rows in the rolling window.",
-            purpose="Raw camera/mic/sensor observations captured every cycle.",
-            used_mb=len(rows) * 0.002,
-            total_mb=50,
-            entries=entries[-100:],
-        )
+    @app.get("/memory/{memory_type}/summary")
+    def memory_summary(memory_type: str):
+        """
+        Returns a summary card for one of the four Memory Core subsystems, in
+        the exact shape gui.py's MemoryCoreCard / MemoryDetailPopup expect:
+        {title, short_desc, purpose, used_mb, total_mb, entries: [(title, detail, ts), ...]}
+        """
+        if memory_type == "short_term":
+            rows = brain.get_short_term_snapshot()
+            entries = [
+                (f"{r.get('source')}:{r.get('data_type')}",
+                 str(r.get("attributes")), r.get("timestamp", ""))
+                for r in rows
+            ]
+            return _memory_card(
+                title="Short Term Memory",
+                short_desc=f"{len(rows)} raw sensory rows in the rolling window.",
+                purpose="Raw camera/mic/sensor observations captured every cycle.",
+                used_mb=len(rows) * 0.002,
+                total_mb=50,
+                entries=entries[-100:],
+            )
 
-    if memory_type == "semantic":
-        facts = brain.semantic.get_facts(active_only=False)
-        entries = [
-            (f.title, f"{f.category}: {f.meaning} (confidence={f.confidence:.2f})", f.updated_at)
-            for f in facts
-        ]
-        return _memory_card(
-            title="Semantic Memory",
-            short_desc=f"{len(facts)} learned facts.",
-            purpose="Permanent, generalized knowledge learned from repeated situations.",
-            used_mb=len(facts) * 0.01,
-            total_mb=50,
-            entries=entries,
-        )
+        if memory_type == "semantic":
+            facts = brain.semantic.get_facts(active_only=False)
+            entries = [
+                (f.title, f"{f.category}: {f.meaning} (confidence={f.confidence:.2f})", f.updated_at)
+                for f in facts
+            ]
+            return _memory_card(
+                title="Semantic Memory",
+                short_desc=f"{len(facts)} learned facts.",
+                purpose="Permanent, generalized knowledge learned from repeated situations.",
+                used_mb=len(facts) * 0.01,
+                total_mb=50,
+                entries=entries,
+            )
 
-    if memory_type == "behavioral":
-        behaviors = brain.behavioral.get_behaviors(active_only=False)
-        entries = [
-            (b.action.get("type", b.behavior_id),
-             f"stage={b.stage}, confidence={b.confidence:.2f}, success_rate={b.success_rate:.2f}",
-             b.updated_at)
-            for b in behaviors
-        ]
-        return _memory_card(
-            title="Behavioral Memory",
-            short_desc=f"{len(behaviors)} learned behaviors.",
-            purpose="Selects/learns the best action for the current context.",
-            used_mb=len(behaviors) * 0.01,
-            total_mb=50,
-            entries=entries,
-        )
+        if memory_type == "behavioral":
+            behaviors = brain.behavioral.get_behaviors(active_only=False)
+            entries = [
+                (b.action.get("type", b.behavior_id),
+                 f"stage={b.stage}, confidence={b.confidence:.2f}, success_rate={b.success_rate:.2f}",
+                 b.updated_at)
+                for b in behaviors
+            ]
+            return _memory_card(
+                title="Behavioral Memory",
+                short_desc=f"{len(behaviors)} learned behaviors.",
+                purpose="Selects/learns the best action for the current context.",
+                used_mb=len(behaviors) * 0.01,
+                total_mb=50,
+                entries=entries,
+            )
 
-    if memory_type == "episodic":
-        episodes = brain.episodic.get_episodes(active_only=False)
-        entries = [
-            (e.episode_id, f"emotion={e.emotional_state}, importance={e.importance_score:.2f}", e.timestamp)
-            for e in episodes
-        ]
-        return _memory_card(
-            title="Episodic Memory",
-            short_desc=f"{len(episodes)} logged episodes.",
-            purpose="Timestamped log of experiences (situation + action + outcome).",
-            used_mb=len(episodes) * 0.02,
-            total_mb=50,
-            entries=entries,
-        )
+        if memory_type == "episodic":
+            episodes = brain.episodic.get_episodes(active_only=False)
+            entries = [
+                (e.episode_id, f"emotion={e.emotional_state}, importance={e.importance_score:.2f}", e.timestamp)
+                for e in episodes
+            ]
+            return _memory_card(
+                title="Episodic Memory",
+                short_desc=f"{len(episodes)} logged episodes.",
+                purpose="Timestamped log of experiences (situation + action + outcome).",
+                used_mb=len(episodes) * 0.02,
+                total_mb=50,
+                entries=entries,
+            )
 
-    raise HTTPException(status_code=404, detail=f"Unknown memory_type '{memory_type}'.")
+        raise HTTPException(status_code=404, detail=f"Unknown memory_type '{memory_type}'.")
+
+    return app
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+    # server.py is intentionally NOT an independent entry point anymore --
+    # Brain.py is the single place that creates Brain(), builds the app via
+    # create_app(brain), and runs uvicorn. Running this file directly is a
+    # no-op by design so there's only ever one way to start Pluto.
+    raise SystemExit(
+        "server.py is no longer runnable on its own.\n"
+        "Run:  python Brain.py\n"
+        "Brain.py owns the single Brain instance, builds this app around it "
+        "via create_app(brain), and starts uvicorn itself."
+    )

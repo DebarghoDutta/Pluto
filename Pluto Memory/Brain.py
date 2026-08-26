@@ -73,9 +73,25 @@ Usage:
     ...
     brain.run_cycle()          # perception -> ... -> memory update, once
     ...
-    brain.reload_owners()      # after server.py finishes a registration request
+    brain.reload_owners()      # after a registration request finishes
     ...
     brain.stop()
+
+Single point of execution
+--------------------------
+Brain.py -- not server.py -- is the ONLY thing you run on the Pi. server.py
+no longer creates its own Brain instance or launches uvicorn itself; it just
+exposes create_app(brain), a factory that builds the FastAPI app around
+whatever Brain instance it's given. This file's `__main__` block:
+    1. creates the single Brain() instance,
+    2. builds the FastAPI app via server.create_app(brain),
+    3. starts the brain (STM capture + background pipeline loop),
+    4. runs uvicorn in the foreground,
+    5. stops the brain on shutdown (Ctrl+C / uvicorn exit).
+
+Run on the Pi with:
+    pip install fastapi "uvicorn[standard]" python-multipart
+    python Brain.py
 """
 
 import time
@@ -507,19 +523,26 @@ class Brain:
 
 
 if __name__ == "__main__":
-    # brain.start() now starts STM capture AND the background cycle loop
-    # (see CYCLE_INTERVAL_SECONDS) that keeps run_cycle() ticking on its
-    # own -- no manual run_cycle() calls needed here anymore. This block is
-    # just a status printer for local/manual testing.
+    # Brain.py is the single point of execution for the whole Pi side.
+    # It owns the one Brain instance, hands it to server.py's create_app()
+    # to build the FastAPI app, starts the brain (STM capture + background
+    # pipeline loop), and then runs uvicorn itself in the foreground.
+    # server.py is never launched on its own -- see the guard at the
+    # bottom of that file.
+    import uvicorn
+    from server import create_app
+
     brain = Brain()
+    app = create_app(brain)
+
     brain.start()
+    print(f"Pluto Brain running (pipeline ticking every {CYCLE_INTERVAL_SECONDS}s). "
+          "Starting FastAPI server on 0.0.0.0:8000. Press Ctrl+C to stop.")
     try:
-        print(f"Pluto Brain running (pipeline ticking every {CYCLE_INTERVAL_SECONDS}s). "
-              "Press Ctrl+C to stop.")
-        while True:
-            time.sleep(5)
-            snapshot = brain.get_short_term_snapshot()
-            print(f"STM rows in window: {len(snapshot)} | cycles run: {brain._cycle_count}")
-    except KeyboardInterrupt:
+        # Blocks until Ctrl+C / process signal; uvicorn handles that
+        # gracefully and returns rather than raising, so brain.stop() below
+        # always runs on shutdown.
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    finally:
         brain.stop()
         print("Stopped.")

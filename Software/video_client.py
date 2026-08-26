@@ -75,6 +75,7 @@ class PlutoVideoClient:
         self._thread: Optional[threading.Thread] = None
         self._should_run = False
         self._connected = False
+        self._retry_count = 0
 
         # simple rolling FPS counter
         self._frame_count = 0
@@ -128,9 +129,12 @@ class PlutoVideoClient:
                     on_error=self._handle_error,
                     on_close=self._handle_close,
                 )
-                # Binary frames can be large; disable auto-ping timeout issues
-                # by keeping pings frequent and lightweight.
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+                # ping_timeout must stay comfortably below ping_interval, but
+                # too tight a margin (e.g. 20/10) force-closes the socket on
+                # any brief latency spike -- common over Tailscale, which
+                # periodically re-handshakes/relays. Loosen both so a
+                # transient blip doesn't read as a real disconnect.
+                self._ws.run_forever(ping_interval=25, ping_timeout=20)
             except Exception as e:
                 logger.error(f"Video WebSocket loop error: {e}")
 
@@ -139,11 +143,14 @@ class PlutoVideoClient:
                 self.on_disconnect_cb()
 
             if self._should_run:
-                logger.info(f"Reconnecting video stream in {self.reconnect_interval}s...")
-                time.sleep(self.reconnect_interval)
+                delay = min(self.reconnect_interval * (2 ** self._retry_count), 20.0)
+                self._retry_count += 1
+                logger.info(f"Reconnecting video stream in {delay:.1f}s...")
+                time.sleep(delay)
 
     def _handle_open(self, ws):
         self._connected = True
+        self._retry_count = 0  # reset backoff now that we're actually connected
         self._frame_count = 0
         self._last_fps_ts = time.time()
         logger.info("Connected to Pluto camera stream.")

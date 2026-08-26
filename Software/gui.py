@@ -368,21 +368,25 @@ class RobotCore:
         False (and leaves the caller to inspect self.last_error) otherwise.
 
         server.py's /owners/register endpoint (owner_manager.py) requires
-        AT LEAST ONE face file AND one voice file in the SAME call -- so
-        both must be captured before this is invoked (see save_owner()'s
-        validation in OwnerRegistrationFrame).
+        AT LEAST ONE face file AND one voice file in the SAME call.
+        OwnerRegistrationFrame now always sends multiple samples of each
+        (front + both side face angles, several voice clips) -- see
+        `face_paths` / `voice_paths` below -- so recognition has real
+        angle/utterance coverage instead of a single frame/clip.
         """
         if not self.api:
             self.last_error = "API client unavailable (install 'requests')."
             return False
 
         name = owner_data.get("name", "owner")
+        face_paths = [p for p in owner_data.get("face_paths", []) if p]
+        voice_paths = [p for p in owner_data.get("voice_paths", []) if p]
 
-        if not (owner_data.get("face_captured") and owner_data.get("face_path")):
-            self.last_error = "A face capture is required to register an owner."
+        if not face_paths:
+            self.last_error = "At least one face capture is required to register an owner."
             return False
-        if not (owner_data.get("voice_captured") and owner_data.get("voice_path")):
-            self.last_error = "A voice sample is required to register an owner."
+        if not voice_paths:
+            self.last_error = "At least one voice sample is required to register an owner."
             return False
 
         # owner_manager.py validates dob strictly as 'YYYY-MM-DD'; the GUI's
@@ -393,8 +397,8 @@ class RobotCore:
             self.api.register_owner(
                 owner_name=name,
                 dob=dob,
-                face_paths=[owner_data["face_path"]],
-                voice_paths=[owner_data["voice_path"]],
+                face_paths=face_paths,
+                voice_paths=voice_paths,
             )
             self.last_error = None
             return True
@@ -1159,19 +1163,43 @@ class DashboardFrame(tk.Frame):
 # ============================================================================
 #  OWNER REGISTRATION TAB
 # ============================================================================
+
+# Face samples required per owner: two side profiles + one straight-on
+# front shot, so recognition has real angle coverage instead of a single
+# frontal image. Each entry is (key, short label, on-screen capture prompt).
+FACE_POSES = [
+    ("front", "Front", "Look straight at the camera"),
+    ("left", "Left Side", "Turn your head to show your LEFT side"),
+    ("right", "Right Side", "Turn your head to show your RIGHT side"),
+]
+
+# Voice samples required per owner: multiple short clips (not just one)
+# so speaker recognition has more than a single utterance to learn from.
+VOICE_PROMPTS = [
+    "Say your name and today's date",
+    "Count slowly from one to ten",
+    "Say a short sentence of your choice",
+]
+
+
 class OwnerRegistrationFrame(tk.Frame):
     def __init__(self, parent, robot: RobotCore):
         super().__init__(parent, bg=Theme.BG)
         self.robot = robot
-        self.face_captured = False
-        self.voice_captured = False
-        self.face_path = None
-        self.voice_path = None
+
+        # Per-slot capture state -- one entry per FACE_POSES / VOICE_PROMPTS
+        # item, keyed the same way, each holding {"path": None, "captured": False}.
+        self.face_samples = {key: {"path": None, "captured": False} for key, _, _ in FACE_POSES}
+        self.voice_samples = {i: {"path": None, "captured": False} for i in range(len(VOICE_PROMPTS))}
+        # Widget references per slot, filled in as each row is built below.
+        self.face_widgets = {}
+        self.voice_widgets = {}
 
         tk.Label(self, text="Register Owner", font=(Theme.FONT, 19, "bold"),
                  bg=Theme.BG, fg=Theme.TEXT_MAIN).pack(anchor="w", padx=28, pady=(22, 4))
-        tk.Label(self, text="Enroll a person's name, date of birth, face sample, and voice "
-                             "sample so the robot can recognize them later.",
+        tk.Label(self, text=f"Enroll a person's name, date of birth, {len(FACE_POSES)} face "
+                             f"samples (front + both sides), and {len(VOICE_PROMPTS)} voice "
+                             f"samples so the robot can recognize them later.",
                  font=(Theme.FONT, 10), bg=Theme.BG, fg=Theme.TEXT_SUB
                  ).pack(anchor="w", padx=28, pady=(0, 16))
 
@@ -1213,35 +1241,47 @@ class OwnerRegistrationFrame(tk.Frame):
         self.month_cb.pack(side="left", padx=6)
         self.year_cb.pack(side="left")
 
-        section_label("FACE SAMPLE")
-        face_row = tk.Frame(form_panel, bg=Theme.CARD)
-        face_row.pack(fill="x", padx=20, pady=(8, 0))
-        self.face_canvas = tk.Canvas(face_row, width=64, height=64, bg=Theme.TRACK,
-                                      highlightthickness=1, highlightbackground=Theme.BORDER)
-        self.face_canvas.pack(side="left")
-        self._draw_face_placeholder()
-        face_btns = tk.Frame(face_row, bg=Theme.CARD)
-        face_btns.pack(side="left", padx=14)
-        self.face_status_label = tk.Label(face_btns, text="No face captured yet",
-                                           font=(Theme.FONT, 9), bg=Theme.CARD, fg=Theme.TEXT_SUB)
-        self.face_status_label.pack(anchor="w")
-        self.capture_face_btn = self._make_button(face_btns, "Capture Face (Camera)", self.capture_face)
-        self.capture_face_btn.pack(anchor="w", pady=(6, 0))
+        # -- FACE SAMPLES (front + left side + right side) --------------------
+        section_label(f"FACE SAMPLES ({len(FACE_POSES)} REQUIRED)")
+        for key, label, prompt in FACE_POSES:
+            face_row = tk.Frame(form_panel, bg=Theme.CARD)
+            face_row.pack(fill="x", padx=20, pady=(8, 0))
+            canvas = tk.Canvas(face_row, width=48, height=48, bg=Theme.TRACK,
+                                highlightthickness=1, highlightbackground=Theme.BORDER)
+            canvas.pack(side="left")
+            face_btns = tk.Frame(face_row, bg=Theme.CARD)
+            face_btns.pack(side="left", padx=14)
+            status_label = tk.Label(face_btns, text=f"{label}: not captured yet",
+                                     font=(Theme.FONT, 9), bg=Theme.CARD, fg=Theme.TEXT_SUB)
+            status_label.pack(anchor="w")
+            btn = self._make_button(face_btns, f"Capture {label}",
+                                     lambda k=key: self.capture_face(k))
+            btn.pack(anchor="w", pady=(6, 0))
+            self.face_widgets[key] = {"canvas": canvas, "status": status_label, "btn": btn,
+                                       "label": label, "prompt": prompt}
+            self._draw_face_placeholder(key)
 
-        section_label("SPEECH SAMPLE")
-        voice_row = tk.Frame(form_panel, bg=Theme.CARD)
-        voice_row.pack(fill="x", padx=20, pady=(8, 0))
-        self.voice_canvas = tk.Canvas(voice_row, width=140, height=48, bg=Theme.TRACK,
-                                       highlightthickness=1, highlightbackground=Theme.BORDER)
-        self.voice_canvas.pack(side="left")
-        self._draw_voice_placeholder()
-        voice_btns = tk.Frame(voice_row, bg=Theme.CARD)
-        voice_btns.pack(side="left", padx=14)
-        self.voice_status_label = tk.Label(voice_btns, text="No voice sample recorded",
-                                            font=(Theme.FONT, 9), bg=Theme.CARD, fg=Theme.TEXT_SUB)
-        self.voice_status_label.pack(anchor="w")
-        self.record_voice_btn = self._make_button(voice_btns, "Record Voice Sample", self.capture_voice)
-        self.record_voice_btn.pack(anchor="w", pady=(6, 0))
+        # -- VOICE SAMPLES (multiple short clips) ------------------------------
+        section_label(f"VOICE SAMPLES ({len(VOICE_PROMPTS)} REQUIRED)")
+        for idx, prompt in enumerate(VOICE_PROMPTS):
+            voice_row = tk.Frame(form_panel, bg=Theme.CARD)
+            voice_row.pack(fill="x", padx=20, pady=(8, 0))
+            canvas = tk.Canvas(voice_row, width=110, height=40, bg=Theme.TRACK,
+                                highlightthickness=1, highlightbackground=Theme.BORDER)
+            canvas.pack(side="left")
+            voice_btns = tk.Frame(voice_row, bg=Theme.CARD)
+            voice_btns.pack(side="left", padx=14)
+            status_label = tk.Label(voice_btns, text=f"Sample {idx + 1}: not recorded yet "
+                                                       f"(\u201c{prompt}\u201d)",
+                                     font=(Theme.FONT, 9), bg=Theme.CARD, fg=Theme.TEXT_SUB,
+                                     wraplength=260, justify="left")
+            status_label.pack(anchor="w")
+            btn = self._make_button(voice_btns, f"Record Sample {idx + 1}",
+                                     lambda i=idx: self.capture_voice(i))
+            btn.pack(anchor="w", pady=(6, 0))
+            self.voice_widgets[idx] = {"canvas": canvas, "status": status_label, "btn": btn,
+                                        "prompt": prompt}
+            self._draw_voice_placeholder(idx)
 
         btn_row = tk.Frame(form_panel, bg=Theme.CARD)
         btn_row.pack(fill="x", padx=20, pady=22)
@@ -1322,31 +1362,42 @@ class OwnerRegistrationFrame(tk.Frame):
         btn.bind("<Leave>", lambda e: btn.config(bg=Theme.ACCENT, fg="#052622"))
         return btn
 
-    def _draw_face_placeholder(self, captured=False):
-        c = self.face_canvas
+    def _draw_face_placeholder(self, key, captured=False):
+        w = self.face_widgets[key]
+        c = w["canvas"]
         c.delete("all")
         color = Theme.GOOD if captured else Theme.TEXT_SUB
-        icon_person(c, 32, 30, 56, color)
+        icon_person(c, 24, 22, 40, color)
 
-    def _draw_voice_placeholder(self, captured=False):
-        c = self.voice_canvas
+    def _draw_voice_placeholder(self, idx, captured=False):
+        w = self.voice_widgets[idx]
+        c = w["canvas"]
         c.delete("all")
         color = Theme.GOOD if captured else Theme.TEXT_SUB
-        bars = 16
-        w = 140 / bars
+        bars = 14
+        width = 110 / bars
         for i in range(bars):
-            h = random.randint(8, 36) if captured else 5 + int(9 * abs(math.sin(i * 0.7)))
-            x0 = i * w + 3
-            c.create_rectangle(x0, 24 - h / 2, x0 + w - 4, 24 + h / 2, fill=color, outline="")
+            h = random.randint(6, 28) if captured else 4 + int(7 * abs(math.sin(i * 0.7)))
+            x0 = i * width + 2
+            c.create_rectangle(x0, 20 - h / 2, x0 + width - 3, 20 + h / 2, fill=color, outline="")
+
+    def _all_slot_buttons(self):
+        for w in self.face_widgets.values():
+            yield w["btn"]
+        for w in self.voice_widgets.values():
+            yield w["btn"]
 
     def _set_busy(self, busy):
-        """Disable/enable the interactive buttons while a capture is running."""
+        """Disable/enable every capture/save/clear button while one capture
+        is running, so samples can't be started concurrently."""
         state = "disabled" if busy else "normal"
-        for btn in (self.capture_face_btn, self.record_voice_btn, self.save_btn, self.clear_btn):
+        for btn in self._all_slot_buttons():
             btn.config(state=state)
+        self.save_btn.config(state=state)
+        self.clear_btn.config(state=state)
 
     # -- FACE CAPTURE (real camera, via face_capture.py) -----------------------
-    def capture_face(self):
+    def capture_face(self, key):
         if face_capture is None:
             messagebox.showerror(
                 "Camera Module Not Available",
@@ -1356,58 +1407,64 @@ class OwnerRegistrationFrame(tk.Frame):
             )
             return
 
+        widget = self.face_widgets[key]
         name = self.name_entry.get().strip() or "owner"
-        self.face_status_label.config(text="Opening camera... look at the preview window",
-                                       fg=Theme.WARN)
+        widget["status"].config(
+            text=f"{widget['label']}: opening camera\u2026 {widget['prompt']}", fg=Theme.WARN)
         self._set_busy(True)
 
         def worker():
             try:
-                path = face_capture.capture_face(owner_name=name)
+                path = face_capture.capture_face(
+                    owner_name=f"{name}_{key}", instruction=widget["prompt"])
                 error = None
             except Exception as e:  # camera/hardware errors surface here
                 path = None
                 error = str(e)
             # hop back onto the Tkinter main thread to touch any widgets
-            self.after(0, lambda: self._on_face_captured(path, error))
+            self.after(0, lambda: self._on_face_captured(key, path, error))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_face_captured(self, path, error):
+    def _on_face_captured(self, key, path, error):
         self._set_busy(False)
+        widget = self.face_widgets[key]
         if path:
-            self.face_path = path
-            self.face_captured = True
-            self._show_face_thumbnail(path)
-            self.face_status_label.config(text=f"Face captured: {os.path.basename(path)}",
-                                           fg=Theme.GOOD)
+            self.face_samples[key] = {"path": path, "captured": True}
+            self._show_face_thumbnail(key, path)
+            widget["status"].config(text=f"{widget['label']}: captured ({os.path.basename(path)})",
+                                     fg=Theme.GOOD)
         else:
-            self.face_captured = False
-            self._draw_face_placeholder(captured=False)
-            self.face_status_label.config(text="Face capture failed / cancelled", fg=Theme.BAD)
+            self.face_samples[key] = {"path": None, "captured": False}
+            self._draw_face_placeholder(key, captured=False)
+            widget["status"].config(text=f"{widget['label']}: capture failed / cancelled",
+                                     fg=Theme.BAD)
             if error:
                 messagebox.showerror("Face Capture Failed",
-                                      f"Could not capture a face.\n\n{error}")
+                                      f"Could not capture the {widget['label'].lower()} face "
+                                      f"sample.\n\n{error}")
             else:
                 messagebox.showwarning("Face Capture Cancelled",
                                         "No image was captured. Make sure a webcam is connected "
                                         "and try again (press ESC in the preview window to cancel).")
 
-    def _show_face_thumbnail(self, path):
+    def _show_face_thumbnail(self, key, path):
+        widget = self.face_widgets[key]
+        canvas = widget["canvas"]
         try:
             img = tk.PhotoImage(file=path)
-            factor_x = max(1, img.width() // 64)
-            factor_y = max(1, img.height() // 64)
+            factor_x = max(1, img.width() // 48)
+            factor_y = max(1, img.height() // 48)
             img = img.subsample(factor_x, factor_y)
-            self._face_img_ref = img  # keep a reference so it isn't garbage-collected
-            self.face_canvas.delete("all")
-            self.face_canvas.create_image(32, 32, image=img)
+            widget["_img_ref"] = img  # keep a reference so it isn't garbage-collected
+            canvas.delete("all")
+            canvas.create_image(24, 24, image=img)
         except tk.TclError:
             # PNG couldn't be loaded directly (older Tk); fall back to the icon
-            self._draw_face_placeholder(captured=True)
+            self._draw_face_placeholder(key, captured=True)
 
     # -- VOICE CAPTURE (real microphone, via voice_capture.py) -----------------
-    def capture_voice(self):
+    def capture_voice(self, idx):
         if voice_capture is None:
             messagebox.showerror(
                 "Microphone Module Not Available",
@@ -1419,54 +1476,58 @@ class OwnerRegistrationFrame(tk.Frame):
             )
             return
 
+        widget = self.voice_widgets[idx]
         name = self.name_entry.get().strip() or "owner"
         duration = 4
-        self.voice_status_label.config(text=f"Recording... speak now ({duration}s)", fg=Theme.WARN)
+        widget["status"].config(text=f"Sample {idx + 1}: recording\u2026 say: "
+                                      f"\u201c{widget['prompt']}\u201d ({duration}s)", fg=Theme.WARN)
         self._set_busy(True)
 
         def on_progress(elapsed, total):
             remaining = max(0, int(total - elapsed) + 1)
-            self.after(0, lambda: self.voice_status_label.config(
-                text=f"Recording... {remaining}s left", fg=Theme.WARN))
+            self.after(0, lambda: widget["status"].config(
+                text=f"Sample {idx + 1}: recording\u2026 {remaining}s left", fg=Theme.WARN))
 
         def worker():
             try:
-                path = voice_capture.record_voice(owner_name=name, duration=duration,
+                path = voice_capture.record_voice(owner_name=f"{name}_sample{idx + 1}",
+                                                   duration=duration,
                                                    progress_callback=on_progress)
                 error = None
             except Exception as e:
                 path = None
                 error = str(e)
-            self.after(0, lambda: self._on_voice_captured(path, error))
+            self.after(0, lambda: self._on_voice_captured(idx, path, error))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_voice_captured(self, path, error):
+    def _on_voice_captured(self, idx, path, error):
         self._set_busy(False)
+        widget = self.voice_widgets[idx]
         if path:
-            self.voice_path = path
-            self.voice_captured = True
-            self._draw_voice_waveform(path)
-            self.voice_status_label.config(text=f"Voice recorded: {os.path.basename(path)}",
-                                            fg=Theme.GOOD)
+            self.voice_samples[idx] = {"path": path, "captured": True}
+            self._draw_voice_waveform(idx, path)
+            widget["status"].config(text=f"Sample {idx + 1}: recorded ({os.path.basename(path)})",
+                                     fg=Theme.GOOD)
         else:
-            self.voice_captured = False
-            self._draw_voice_placeholder(captured=False)
-            self.voice_status_label.config(text="Voice recording failed", fg=Theme.BAD)
+            self.voice_samples[idx] = {"path": None, "captured": False}
+            self._draw_voice_placeholder(idx, captured=False)
+            widget["status"].config(text=f"Sample {idx + 1}: recording failed", fg=Theme.BAD)
             if error:
                 messagebox.showerror("Voice Recording Failed",
-                                      f"Could not record audio.\n\n{error}")
+                                      f"Could not record audio for sample {idx + 1}.\n\n{error}")
             else:
                 messagebox.showwarning("Voice Recording Failed",
                                         "No audio was recorded. Make sure a microphone is "
                                         "connected and try again.")
 
-    def _draw_voice_waveform(self, path):
+    def _draw_voice_waveform(self, idx, path):
         """Draw a real (downsampled) waveform from the recorded WAV file."""
-        c = self.voice_canvas
+        widget = self.voice_widgets[idx]
+        c = widget["canvas"]
         c.delete("all")
-        bars = 16
-        amplitudes = [10] * bars
+        bars = 14
+        amplitudes = [8] * bars
         if AUDIOOP_AVAILABLE:
             try:
                 with wave.open(path, "rb") as wf:
@@ -1483,25 +1544,27 @@ class OwnerRegistrationFrame(tk.Frame):
             except (wave.Error, OSError):
                 pass
         max_amp = max(amplitudes) or 1
+        width = 110 / bars
         for i, amp in enumerate(amplitudes):
-            h = 4 + (amp / max_amp) * 34
-            w = 140 / bars
-            x0 = i * w + 3
-            c.create_rectangle(x0, 24 - h / 2, x0 + w - 4, 24 + h / 2, fill=Theme.GOOD, outline="")
+            h = 3 + (amp / max_amp) * 28
+            x0 = i * width + 2
+            c.create_rectangle(x0, 20 - h / 2, x0 + width - 3, 20 + h / 2, fill=Theme.GOOD, outline="")
 
     def clear_form(self):
         self.name_entry.delete(0, tk.END)
         self.day_cb.set("")
         self.month_cb.set("")
         self.year_cb.set("")
-        self.face_captured = False
-        self.voice_captured = False
-        self.face_path = None
-        self.voice_path = None
-        self._draw_face_placeholder(captured=False)
-        self._draw_voice_placeholder(captured=False)
-        self.face_status_label.config(text="No face captured yet", fg=Theme.TEXT_SUB)
-        self.voice_status_label.config(text="No voice sample recorded", fg=Theme.TEXT_SUB)
+        for key, (_, label, prompt) in zip(self.face_samples.keys(), FACE_POSES):
+            self.face_samples[key] = {"path": None, "captured": False}
+            self._draw_face_placeholder(key, captured=False)
+            self.face_widgets[key]["status"].config(text=f"{label}: not captured yet",
+                                                      fg=Theme.TEXT_SUB)
+        for idx, prompt in enumerate(VOICE_PROMPTS):
+            self.voice_samples[idx] = {"path": None, "captured": False}
+            self._draw_voice_placeholder(idx, captured=False)
+            self.voice_widgets[idx]["status"].config(
+                text=f"Sample {idx + 1}: not recorded yet (\u201c{prompt}\u201d)", fg=Theme.TEXT_SUB)
 
     def save_owner(self):
         name = self.name_entry.get().strip()
@@ -1512,17 +1575,34 @@ class OwnerRegistrationFrame(tk.Frame):
             messagebox.showwarning("Missing DOB", "Please select the full date of birth.")
             return
 
+        missing_faces = [w["label"] for key, w in self.face_widgets.items()
+                          if not self.face_samples[key]["captured"]]
+        if missing_faces:
+            messagebox.showwarning(
+                "Missing Face Samples",
+                "Please capture all required face samples first.\n\n"
+                f"Still needed: {', '.join(missing_faces)}"
+            )
+            return
+
+        missing_voices = [i + 1 for i in self.voice_widgets if not self.voice_samples[i]["captured"]]
+        if missing_voices:
+            messagebox.showwarning(
+                "Missing Voice Samples",
+                "Please record all required voice samples first.\n\n"
+                f"Still needed: Sample(s) {', '.join(str(n) for n in missing_voices)}"
+            )
+            return
+
         dob = f"{self.day_cb.get()}-{self.month_cb.get()}-{self.year_cb.get()}"
         record = {
             "name": name,
             "dob": dob,
-            "face_captured": self.face_captured,
-            "face_path": self.face_path,
-            "voice_captured": self.voice_captured,
-            "voice_path": self.voice_path,
+            "face_paths": [self.face_samples[key]["path"] for key, _, _ in FACE_POSES],
+            "voice_paths": [self.voice_samples[i]["path"] for i in range(len(VOICE_PROMPTS))],
         }
 
-        enrolled = self.robot.register_owner(record)  # sends face/voice to Pluto
+        enrolled = self.robot.register_owner(record)  # sends all face/voice samples to Pluto
 
         if enrolled:
             # Pluto's pluto.db is the only source of truth -- reload the
@@ -1530,7 +1610,8 @@ class OwnerRegistrationFrame(tk.Frame):
             self.refresh_owners()
             messagebox.showinfo(
                 "Owner Saved",
-                f"{name} has been enrolled on Pluto for face/voice recognition."
+                f"{name} has been enrolled on Pluto with {len(FACE_POSES)} face samples and "
+                f"{len(VOICE_PROMPTS)} voice samples."
             )
             self.clear_form()
         else:
@@ -1912,6 +1993,21 @@ class RobotDashboardApp(tk.Tk):
 
         tk.Frame(self.sidebar, bg=Theme.BG_SIDEBAR).pack(fill="both", expand=True)
 
+        # -- connection status indicator (dot + short text) -----------------
+        # Replaces the old messagebox popups on connect/disconnect: this
+        # little strip always sits above the Connect button and reflects
+        # the live connection state instead of interrupting with a dialog.
+        status_row = tk.Frame(self.sidebar, bg=Theme.BG_SIDEBAR)
+        status_row.pack(fill="x", padx=16, pady=(0, 8), side="bottom")
+        self.conn_dot = tk.Canvas(status_row, width=9, height=9, bg=Theme.BG_SIDEBAR,
+                                   highlightthickness=0)
+        self.conn_dot.pack(side="left")
+        self.conn_dot.create_oval(1, 1, 8, 8, fill=Theme.BAD, outline="", tags="dot")
+        self.conn_status_label = tk.Label(status_row, text="Not connected", anchor="w",
+                                           font=(Theme.FONT, 8, "bold"), bg=Theme.BG_SIDEBAR,
+                                           fg=Theme.TEXT_SUB, wraplength=170, justify="left")
+        self.conn_status_label.pack(side="left", padx=(6, 0), fill="x", expand=True)
+
         connect_btn = tk.Button(self.sidebar, text="\u26a1  Connect to Pluto Core",
                                  anchor="center", relief="flat", font=(Theme.FONT, 10, "bold"),
                                  bg=Theme.ACCENT, fg="#052622", activebackground=Theme.ACCENT_2,
@@ -1919,6 +2015,29 @@ class RobotDashboardApp(tk.Tk):
         connect_btn.pack(fill="x", padx=14, pady=(2, 18), side="bottom")
         connect_btn.bind("<Enter>", lambda e: connect_btn.config(bg=Theme.ACCENT_2, fg="#ffffff"))
         connect_btn.bind("<Leave>", lambda e: connect_btn.config(bg=Theme.ACCENT, fg="#052622"))
+
+        # Keep the indicator honest even without the user re-clicking
+        # Connect: poll the shared robot.connected flag every couple of
+        # seconds so a dropped link (e.g. the telemetry WS gives up) is
+        # reflected automatically.
+        self._poll_connection_indicator()
+
+    def _set_connection_indicator(self, kind, text):
+        """kind: 'good' | 'warn' | 'bad'. Updates the dot color + label text
+        in place -- no popup, no blocking dialog."""
+        color = {"good": Theme.GOOD, "warn": Theme.WARN, "bad": Theme.BAD}.get(kind, Theme.BAD)
+        self.conn_dot.itemconfig("dot", fill=color)
+        self.conn_status_label.config(text=text, fg=color)
+
+    def _poll_connection_indicator(self):
+        if getattr(self, "_connecting", False):
+            pass  # attempt_connect() is driving the indicator right now
+        elif self.robot.connected:
+            self._set_connection_indicator(
+                "good", f"Connected \u2014 {self.robot.host}:{self.robot.api_port}")
+        else:
+            self._set_connection_indicator("bad", "Not connected")
+        self.after(3000, self._poll_connection_indicator)
 
     def _hover_nav(self, key, entering):
         row, lbl = self.nav_buttons[key]
@@ -1957,42 +2076,40 @@ class RobotDashboardApp(tk.Tk):
     def attempt_connect(self):
         """Connects to Pluto: checks the FastAPI health endpoint and starts
         the telemetry + camera WebSocket clients (which keep retrying in
-        the background even if Pluto isn't reachable yet)."""
+        the background even if Pluto isn't reachable yet).
+
+        Feedback for all of this lives in the sidebar's connection status
+        indicator (dot + short text) instead of messagebox popups -- so a
+        connect attempt never blocks the GUI with a dialog the user has to
+        dismiss."""
+        self._connecting = True
         if PlutoAPIClient is None:
-            messagebox.showerror(
-                "API Client Unavailable",
-                f"api_client.py could not be imported.\n\nDetails: {API_CLIENT_ERROR}\n\n"
-                "Install it with:\n    pip install requests"
-            )
+            self._set_connection_indicator(
+                "bad", f"api_client.py unavailable ({API_CLIENT_ERROR}). "
+                       f"Run: pip install requests")
+            self._connecting = False
             return
         if PlutoWebSocketClient is None or PlutoVideoClient is None:
-            messagebox.showerror(
-                "WebSocket Client Unavailable",
-                "websocket_client.py / video_client.py could not be imported.\n\n"
-                f"Details: {WS_CLIENT_ERROR or VIDEO_CLIENT_ERROR}\n\n"
-                "Install it with:\n    pip install websocket-client pillow"
-            )
+            self._set_connection_indicator(
+                "bad",
+                f"WebSocket client unavailable ({WS_CLIENT_ERROR or VIDEO_CLIENT_ERROR}). "
+                f"Run: pip install websocket-client pillow")
+            self._connecting = False
             return
 
+        self._set_connection_indicator("warn", "Connecting\u2026")
+        self.update_idletasks()
+
         ok = self.robot.connect()
+        self._connecting = False
         if ok:
-            messagebox.showinfo(
-                "Connected",
-                f"Connected to Pluto's FastAPI server at "
-                f"{self.robot.host}:{self.robot.api_port}.\n\n"
-                f"Telemetry and camera WebSocket clients are now running and "
-                f"will keep reconnecting automatically if the link drops."
-            )
+            self._set_connection_indicator(
+                "good", f"Connected \u2014 {self.robot.host}:{self.robot.api_port}")
         else:
-            messagebox.showwarning(
-                "Cannot Reach Pluto",
-                f"Could not reach Pluto's FastAPI server at "
-                f"{self.robot.host}:{self.robot.api_port}.\n\n"
-                "Make sure Pluto is powered on, server.py is running, and "
-                "this device is on the same network. The telemetry/camera "
-                "clients will keep retrying in the background and will pick "
-                "up automatically once Pluto comes online."
-            )
+            self._set_connection_indicator(
+                "bad",
+                f"Cannot reach Pluto at {self.robot.host}:{self.robot.api_port}. "
+                f"Retrying in background\u2026")
 
     def _on_close(self):
         self.robot.disconnect()

@@ -25,7 +25,7 @@ What gets pushed (per message, JSON):
         "sensor_snapshot": {...}       # latest reading per sensor key
     }
 
-Usage from server.py:
+Usage from server.py's create_app(brain):
 
     from websocket_server import register_websocket_routes
 
@@ -35,6 +35,13 @@ This attaches:
     - WS  /ws/live         -> live push feed (what this file is about)
     - background task that broadcasts on a fixed interval, started/stopped
       alongside the FastAPI app's own startup/shutdown events.
+
+Not an independent module: this file has no Brain instance of its own and
+no `if __name__ == "__main__":` launcher -- it only ever runs mounted inside
+the app that Brain.py builds (via server.create_app(brain)), and every
+broadcast it sends is read straight from that same shared `brain` object.
+Brain.py is the single point of execution for the whole Pi side; this file
+just adds routes/background tasks to the app Brain.py starts.
 """
 
 import json

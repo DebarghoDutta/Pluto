@@ -50,7 +50,7 @@ def _safe_filename(name):
     return cleaned
 
 
-def capture_face(owner_name="owner", camera_index=0, countdown=3):
+def capture_face(owner_name="owner", camera_index=0, countdown=3, instruction=None):
     """
     Opens the default camera, shows a live preview window with a short
     countdown, and saves a snapshot as a PNG once the countdown reaches zero.
@@ -59,6 +59,12 @@ def capture_face(owner_name="owner", camera_index=0, countdown=3):
         owner_name:   used to build a readable filename.
         camera_index: which camera to open (0 = default/first camera).
         countdown:    seconds to show a live preview before auto-capturing.
+        instruction:  optional short pose instruction shown as an overlay
+                      (e.g. "Turn your head to show your LEFT side"), so
+                      gui.py can reuse this same function once per required
+                      face angle (front / left side / right side) with the
+                      right guidance shown each time. Defaults to a generic
+                      "Look at the camera" prompt when not given.
 
     Returns:
         The absolute path to the saved PNG file, or None if no camera was
@@ -69,6 +75,7 @@ def capture_face(owner_name="owner", camera_index=0, countdown=3):
     own event loop doesn't freeze while the camera window is open.
     """
     _ensure_dir()
+    instruction = instruction or "Look at the camera"
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
@@ -90,7 +97,9 @@ def capture_face(owner_name="owner", camera_index=0, countdown=3):
             h, _ = frame.shape[:2]
 
             display = frame.copy()
-            cv2.putText(display, f"Capturing in {remaining}...", (20, 40),
+            cv2.putText(display, instruction, (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 220, 255), 2, cv2.LINE_AA)
+            cv2.putText(display, f"Capturing in {remaining}...", (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 230, 40), 2, cv2.LINE_AA)
             cv2.putText(display, "Press ESC to cancel", (20, h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)

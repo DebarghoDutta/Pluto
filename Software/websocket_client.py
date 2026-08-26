@@ -64,6 +64,7 @@ class PlutoWebSocketClient:
         self._thread: Optional[threading.Thread] = None
         self._should_run = False
         self._connected = False
+        self._retry_count = 0
 
     # ------------------------------------------------------------------ #
     # Public control
@@ -113,8 +114,13 @@ class PlutoWebSocketClient:
                     on_error=self._handle_error,
                     on_close=self._handle_close,
                 )
-                # run_forever blocks until the socket closes/errors
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+                # run_forever blocks until the socket closes/errors.
+                # ping_timeout must stay comfortably below ping_interval, but
+                # too tight a margin (e.g. 20/10) force-closes the socket on
+                # any brief latency spike -- common over Tailscale, which
+                # periodically re-handshakes/relays. Loosen both so a
+                # transient blip doesn't read as a real disconnect.
+                self._ws.run_forever(ping_interval=25, ping_timeout=20)
             except Exception as e:
                 logger.error(f"WebSocket loop error: {e}")
 
@@ -123,11 +129,18 @@ class PlutoWebSocketClient:
                 self.on_disconnect_cb()
 
             if self._should_run:
-                logger.info(f"Reconnecting in {self.reconnect_interval}s...")
-                time.sleep(self.reconnect_interval)
+                # Small exponential backoff (capped) instead of a fixed 3s,
+                # so a persistently unreachable Pi doesn't get hammered with
+                # reconnect attempts -- but a single transient blip still
+                # recovers almost immediately.
+                delay = min(self.reconnect_interval * (2 ** self._retry_count), 20.0)
+                self._retry_count += 1
+                logger.info(f"Reconnecting in {delay:.1f}s...")
+                time.sleep(delay)
 
     def _handle_open(self, ws):
         self._connected = True
+        self._retry_count = 0  # reset backoff now that we're actually connected
         logger.info("Connected to Pluto telemetry stream.")
         if self.on_connect_cb:
             self.on_connect_cb()

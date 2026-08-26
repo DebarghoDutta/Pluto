@@ -55,8 +55,11 @@ import datetime
 import math
 import os
 import json
+import logging
 import threading
 import wave
+
+logger = logging.getLogger("PlutoGUI")
 
 try:
     import audioop  # stdlib; used only to draw a real waveform preview
@@ -349,12 +352,21 @@ class RobotCore:
     # Four memory subsystems, read live from Pluto over the FastAPI
     # /memory/{type}/summary endpoint (see api_client.get_memory_summary).
     def get_memory_core_data(self):
+        """
+        Reads the four memory summaries from Pluto over REST. This is a
+        real network call -- callers MUST NOT run it on the Tk main thread
+        (see MemoryCoreFrame.refresh, which offloads it to a worker thread).
+
+        Short-circuits to placeholders immediately (no network call at all)
+        when we know we're not connected yet, so the very first render of
+        the Memory Core page never has to wait on 4 doomed HTTP requests.
+        """
         types = ("short_term", "semantic", "behavioral", "episodic")
+        if not self.api or not self.connected:
+            return {t: dict(self._EMPTY_MEMORY_CARD) for t in types}
+
         result = {}
         for t in types:
-            if not self.api:
-                result[t] = dict(self._EMPTY_MEMORY_CARD)
-                continue
             try:
                 result[t] = self.api.get_memory_summary(t)
             except PlutoAPIClientError:
@@ -1917,13 +1929,24 @@ class MemoryCoreFrame(tk.Frame):
         popup.focus_set()
 
     def refresh(self):
-        data = self.robot.get_memory_core_data()
-        self.short_term_card.set_data(data["short_term"])
-        self.semantic_card.set_data(data["semantic"])
-        self.behavioral_card.set_data(data["behavioral"])
-        self.episodic_card.set_data(data["episodic"])
+        # get_memory_core_data() can make real (possibly slow) HTTP calls to
+        # Pluto. Never run that on the Tk main thread -- that's what was
+        # freezing/delaying the GUI. Fetch on a worker thread and only touch
+        # widgets back on the main thread via self.after(0, ...).
+        def worker():
+            data = self.robot.get_memory_core_data()
 
-        self.after(4000, self.refresh)
+            def apply():
+                if not self.winfo_exists():
+                    return  # frame was destroyed while the request was in flight
+                self.short_term_card.set_data(data["short_term"])
+                self.semantic_card.set_data(data["semantic"])
+                self.behavioral_card.set_data(data["behavioral"])
+                self.episodic_card.set_data(data["episodic"])
+                self.after(4000, self.refresh)
+            self.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 # ============================================================================
@@ -2100,16 +2123,32 @@ class RobotDashboardApp(tk.Tk):
         self._set_connection_indicator("warn", "Connecting\u2026")
         self.update_idletasks()
 
-        ok = self.robot.connect()
-        self._connecting = False
-        if ok:
-            self._set_connection_indicator(
-                "good", f"Connected \u2014 {self.robot.host}:{self.robot.api_port}")
-        else:
-            self._set_connection_indicator(
-                "bad",
-                f"Cannot reach Pluto at {self.robot.host}:{self.robot.api_port}. "
-                f"Retrying in background\u2026")
+        # IMPORTANT: robot.connect() does a blocking REST health-check (and
+        # api_client's session/DNS setup). Running it directly on the main
+        # thread freezes the whole window until it returns/times out -- which
+        # is exactly the "GUI delayed" symptom. Do the actual network work on
+        # a background thread and only touch Tk widgets back on the main
+        # thread via self.after().
+        def worker():
+            try:
+                ok = self.robot.connect()
+            except Exception as e:
+                logger.error(f"connect() raised: {e}")
+                ok = False
+
+            def finish():
+                self._connecting = False
+                if ok:
+                    self._set_connection_indicator(
+                        "good", f"Connected \u2014 {self.robot.host}:{self.robot.api_port}")
+                else:
+                    self._set_connection_indicator(
+                        "bad",
+                        f"Cannot reach Pluto at {self.robot.host}:{self.robot.api_port}. "
+                        f"Retrying in background\u2026")
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_close(self):
         self.robot.disconnect()
